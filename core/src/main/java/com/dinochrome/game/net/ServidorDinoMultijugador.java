@@ -1,9 +1,16 @@
+// =====================================================
+// ARCHIVO: ServidorDinoMultijugador.java
+// PAQUETE: com.dinochrome.game.net
+// =====================================================
 package com.dinochrome.game.net;
 
 import java.io.IOException;
 import java.net.*;
 import java.nio.charset.StandardCharsets;
-import java.util.*;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.Map;
+import java.util.Random;
 
 public class ServidorDinoMultijugador {
 
@@ -20,6 +27,10 @@ public class ServidorDinoMultijugador {
     // Obstáculos
     private static final long MS_ENTRE_SPAWNS_MIN = 900;
     private static final long MS_ENTRE_SPAWNS_MAX = 1600;
+
+    // Timeout de jugador (si no manda nada, lo sacamos)
+    // Señor: con 5s va bien para pruebas. Si querés más tolerancia: 8000 o 10000.
+    private static final long TIMEOUT_JUGADOR_MS = 5000;
 
     // -------------------------
     // Estado del servidor
@@ -43,7 +54,6 @@ public class ServidorDinoMultijugador {
         SocketAddress addr;
         boolean listo;
 
-        // último estado recibido (por si querés debug)
         float x, y;
         boolean duck;
         long ultimoPaqueteMs;
@@ -79,12 +89,21 @@ public class ServidorDinoMultijugador {
         while (true) {
             long ahora = System.currentTimeMillis();
 
+            // 0) LIMPIAR JUGADORES CAÍDOS (clave para poder reconectar)
+            limpiarJugadoresPorTimeout(ahora);
+
             // 1) Recibir paquetes (si hay)
             try {
                 DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
                 socket.receive(packet);
 
-                String msg = new String(packet.getData(), 0, packet.getLength(), StandardCharsets.UTF_8).trim();
+                String msg = new String(
+                    packet.getData(),
+                    0,
+                    packet.getLength(),
+                    StandardCharsets.UTF_8
+                ).trim();
+
                 SocketAddress addr = packet.getSocketAddress();
 
                 procesarMensaje(addr, msg);
@@ -100,9 +119,6 @@ public class ServidorDinoMultijugador {
                 enviarObstaculoATodos(generarObstaculo());
                 planificarProximoSpawn();
             }
-
-            // 3) (Opcional) detectar timeouts / desconexiones
-            // Si querés, te lo agrego. Por ahora lo dejo simple.
         }
     }
 
@@ -110,7 +126,20 @@ public class ServidorDinoMultijugador {
     // Procesamiento de mensajes
     // -------------------------
     private void procesarMensaje(SocketAddress addr, String msg) {
-        // Si no está registrado y quiere unirse
+
+        // 0) DESCUBRIMIENTO POR BROADCAST
+        if (msg.equals("BUSCAR_SERVIDOR")) {
+            enviarA(addr, "SERVIDOR_AQUI");
+            return;
+        }
+
+        // (Opcional) BYE explícito
+        if (msg.equals("BYE")) {
+            desconectarJugador(addr, "BYE");
+            return;
+        }
+
+        // 1) JOIN
         if (msg.equals("JOIN")) {
             manejarJoin(addr);
             return;
@@ -118,36 +147,36 @@ public class ServidorDinoMultijugador {
 
         Jugador j = jugadoresPorAddr.get(addr);
         if (j == null) {
-            // Si manda algo sin JOIN previo, lo ignoramos o lo forzamos a JOIN
             enviarA(addr, "ERROR;msg=Primero manda JOIN");
             return;
         }
 
+        // MUY IMPORTANTE: actualizar último contacto en cualquier mensaje válido
         j.ultimoPaqueteMs = System.currentTimeMillis();
 
+        // 2) READY
         if (msg.equals("READY")) {
             manejarReady(j);
             return;
         }
 
+        // 3) STATE (relay)
         if (msg.startsWith("STATE;")) {
             EstadoJugador estado = parsearEstado(msg);
             if (estado == null) return;
 
-            // Actualizo estado interno (opcional)
             j.x = estado.x;
             j.y = estado.y;
             j.duck = estado.duck;
 
-            // Relay: enviar al otro jugador
             Jugador otro = obtenerOtroJugador(j.id);
             if (otro != null) {
-                enviarA(otro.addr, msg); // reenviamos tal cual
+                enviarA(otro.addr, msg);
             }
             return;
         }
 
-        // Mensaje desconocido
+        // 4) Desconocido
         enviarA(addr, "ERROR;msg=Mensaje no reconocido");
     }
 
@@ -155,14 +184,19 @@ public class ServidorDinoMultijugador {
     // JOIN / READY / START
     // -------------------------
     private void manejarJoin(SocketAddress addr) {
+
+        // Si ya estaba conectado (misma addr), re-enviamos info
         if (jugadoresPorAddr.containsKey(addr)) {
-            // ya estaba
             Jugador j = jugadoresPorAddr.get(addr);
+            j.ultimoPaqueteMs = System.currentTimeMillis();
+
             enviarA(addr, "ASSIGN;id=" + j.id);
             enviarA(addr, "COUNT;players=" + jugadoresPorAddr.size());
+            broadcast("COUNT;players=" + jugadoresPorAddr.size());
             return;
         }
 
+        // Si está lleno, no entra
         if (jugadoresPorAddr.size() >= MAX_JUGADORES) {
             enviarA(addr, "FULL");
             return;
@@ -179,17 +213,17 @@ public class ServidorDinoMultijugador {
         jugadoresPorAddr.put(addr, j);
 
         enviarA(addr, "ASSIGN;id=" + idNuevo);
+
+        // Mandar COUNT directo y broadcast (UDP puede perderse)
+        enviarA(addr, "COUNT;players=" + jugadoresPorAddr.size());
         broadcast("COUNT;players=" + jugadoresPorAddr.size());
 
         System.out.println("Jugador conectado id=" + idNuevo + " desde " + addr);
-
-        // Si ya hay 2, todavía no arrancamos: esperamos READY de ambos.
     }
 
     private void manejarReady(Jugador j) {
         j.listo = true;
 
-        // (Opcional) avisar al otro
         broadcast("READY;id=" + j.id + ";value=1");
 
         System.out.println("Jugador id=" + j.id + " listo");
@@ -202,14 +236,63 @@ public class ServidorDinoMultijugador {
     }
 
     // -------------------------
+    // Timeout / desconexión
+    // -------------------------
+    private void limpiarJugadoresPorTimeout(long ahora) {
+        boolean sacoAlguien = false;
+
+        Iterator<Map.Entry<SocketAddress, Jugador>> it = jugadoresPorAddr.entrySet().iterator();
+        while (it.hasNext()) {
+            Map.Entry<SocketAddress, Jugador> entry = it.next();
+            Jugador j = entry.getValue();
+
+            if ((ahora - j.ultimoPaqueteMs) > TIMEOUT_JUGADOR_MS) {
+                System.out.println("Jugador id=" + j.id + " timeout. Se elimina (" + entry.getKey() + ")");
+                it.remove();
+                sacoAlguien = true;
+            }
+        }
+
+        if (sacoAlguien) {
+            // Si alguien se fue, la partida ya no es válida
+            if (jugadoresPorAddr.size() < 2) {
+                partidaIniciada = false;
+
+                // También reseteamos "listo" del que queda, para que el lobby sea coherente
+                for (Jugador j : jugadoresPorAddr.values()) {
+                    j.listo = false;
+                }
+            }
+
+            // Refrescar lobby
+            broadcast("COUNT;players=" + jugadoresPorAddr.size());
+        }
+    }
+
+    private void desconectarJugador(SocketAddress addr, String motivo) {
+        Jugador j = jugadoresPorAddr.remove(addr);
+        if (j != null) {
+            System.out.println("Jugador id=" + j.id + " desconectado (" + motivo + ")");
+
+            if (jugadoresPorAddr.size() < 2) {
+                partidaIniciada = false;
+                for (Jugador restante : jugadoresPorAddr.values()) {
+                    restante.listo = false;
+                }
+            }
+
+            broadcast("COUNT;players=" + jugadoresPorAddr.size());
+        }
+    }
+
+    // -------------------------
     // Obstáculos
     // -------------------------
     private String generarObstaculo() {
-        // Cactus o ptero
         boolean cactus = random.nextBoolean();
         int tipo = cactus ? 0 : 1;
 
-        float x = ANCHO; // aparece en el borde derecho
+        float x = ANCHO;
         float y;
         float w;
         float h;
@@ -224,7 +307,6 @@ public class ServidorDinoMultijugador {
             h = 20;
         }
 
-        // Mensaje
         return "OBST;x=" + x + ";y=" + y + ";w=" + w + ";h=" + h + ";t=" + tipo;
     }
 
@@ -243,7 +325,6 @@ public class ServidorDinoMultijugador {
     // Parseo de estado
     // -------------------------
     private EstadoJugador parsearEstado(String msg) {
-        // Espera: STATE;id=1;x=...;y=...;duck=0
         try {
             String[] partes = msg.split(";");
             if (partes.length < 5) return null;
@@ -280,20 +361,16 @@ public class ServidorDinoMultijugador {
             byte[] data = msg.getBytes(StandardCharsets.UTF_8);
             DatagramPacket p = new DatagramPacket(data, data.length);
 
-            // addr puede ser InetSocketAddress
             if (addr instanceof InetSocketAddress) {
                 InetSocketAddress isa = (InetSocketAddress) addr;
                 p.setAddress(isa.getAddress());
                 p.setPort(isa.getPort());
             } else {
-                // caso raro, intentamos igual
                 return;
             }
 
             socket.send(p);
-        } catch (Exception e) {
-            // si falla, no reventamos el servidor
-        }
+        } catch (Exception ignored) {}
     }
 
     private void broadcast(String msg) {

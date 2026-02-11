@@ -1,3 +1,7 @@
+// =====================================================
+// ARCHIVO: EstadoObstaculo.java
+// PAQUETE: com.dinochrome.game.net
+// =====================================================
 package com.dinochrome.game.net;
 
 public class ObstacleState {

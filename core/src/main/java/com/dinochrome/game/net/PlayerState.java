@@ -1,3 +1,7 @@
+// =====================================================
+// ARCHIVO: PlayerState.java
+// PAQUETE: com.dinochrome.game.net
+// =====================================================
 package com.dinochrome.game.net;
 
 public class PlayerState {
@@ -5,9 +9,5 @@ public class PlayerState {
     public float x;
     public float y;
     public boolean ducking;
-
-    // 🔹 lobby
     public boolean ready;
-    public int playerCount;
-    public boolean startGame;
 }
